@@ -1212,8 +1212,8 @@ static ConvBackend _select_conv_backend(
   if (params.is_depthwise(input, weight)) {
     if (params.use_cudnn_depthwise(input, weight)) {
       return ConvBackend::Cudnn;
-    } else if (params.use_miopen(input, weight, bias_sizes_opt.has_value())) {
-      return ConvBackend::MiopenDepthwise;
+    // } else if (params.use_miopen(input, weight, bias_sizes_opt.has_value())) {
+    //   return ConvBackend::MiopenDepthwise;
     } else {
       if (input.ndimension() == 4) {
         return ConvBackend::CudaDepthwise2d;
