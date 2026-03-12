@@ -449,6 +449,7 @@ Tensor conv_depthwise3d_cuda(
                       "Padded input tensor is too large.");
         }
 
+        DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(3, 5, 5, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(3, 3, 3, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(-1, -1, -1, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_OTHERS
