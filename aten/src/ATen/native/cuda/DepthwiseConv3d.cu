@@ -93,6 +93,111 @@ __global__ void conv_depthwise3d_cuda_kernel(
   }
 }
 
+// Depthwise conv3d with dynamic shared memory (weight + input patch in share memory).
+// Block over (batch, channel, frame); 256 threads over (oh, ow). Template (kT, kH, kW) for unrolling.
+// Dispatched for matching kernel/dilation/stride (e.g. (3,5,5), stride (1,1,1), dilation (1,1,1)).
+template <typename scalar_t, int kT, int kH, int kW>
+__global__ void conv_depthwise3d_cuda_kernel_smem(
+    const PackedTensorAccessor32<const scalar_t, 5> input,
+    PackedTensorAccessor32<scalar_t, 5> output,
+    const PackedTensorAccessor32<const scalar_t, 5> kernel,
+    const scalar_t* bias,
+    int strideT, int strideH, int strideW,
+    int paddingT, int paddingH, int paddingW,
+    int dilationT_, int dilationH_, int dilationW_)
+{
+  constexpr int WEIGHT_SIZE = kT * kH * kW;
+  const int oC = output.size(1);
+  const int oT = output.size(2);
+  const int oH = output.size(3);
+  const int oW = output.size(4);
+  const int iT = input.size(2);
+  const int iH = input.size(3);
+  const int iW = input.size(4);
+  // Host launch must pass smem = (WEIGHT_SIZE + input_patch_size) * sizeof(scalar_t), computed at launch.
+  const int in_tile_h = (oH - 1) * strideH + (kH - 1) * dilationH_ + 1;
+  const int in_tile_w = (oW - 1) * strideW + (kW - 1) * dilationW_ + 1;
+  const int in_tile_hw = in_tile_h * in_tile_w;
+  const int input_patch_size = kT * in_tile_hw;
+
+  extern __shared__ char smem_base[];
+  scalar_t* s_weight = reinterpret_cast<scalar_t*>(smem_base);
+  scalar_t* s_input = reinterpret_cast<scalar_t*>(smem_base + WEIGHT_SIZE * sizeof(scalar_t));
+
+  const int slice_idx = blockIdx.x;
+  const int b = slice_idx / (oC * oT);
+  const int rest = slice_idx % (oC * oT);
+  const int out_channel = rest / oT;
+  const int out_frame = rest % oT;
+
+  const int in_frame_start = out_frame * strideT - paddingT;
+  const int in_row_start = -paddingH;
+  const int in_col_start = -paddingW;
+
+  const scalar_t* kernel_ptr = kernel[out_channel].data();
+  for (int base = threadIdx.x * 4; base < WEIGHT_SIZE; base += blockDim.x * 4) {
+    for (int i = 0; i < 4 && (base + i) < WEIGHT_SIZE; ++i)
+      s_weight[base + i] = kernel_ptr[base + i];
+  }
+  __syncthreads();
+
+  for (int base = threadIdx.x * 4; base < input_patch_size; base += blockDim.x * 4) {
+    for (int i = 0; i < 4 && (base + i) < input_patch_size; ++i) {
+      const int idx = base + i;
+      const int kfi = idx / in_tile_hw;
+      const int hri = (idx / in_tile_w) % in_tile_h;
+      const int wci = idx % in_tile_w;
+      const int in_fi = in_frame_start + kfi * dilationT_;
+      const int in_ri = in_row_start + hri;
+      const int in_ci = in_col_start + wci;
+      float val = 0.0f;
+      if (in_fi >= 0 && in_fi < iT && in_ri >= 0 && in_ri < iH && in_ci >= 0 && in_ci < iW)
+        val = static_cast<float>(input[b][out_channel][in_fi][in_ri][in_ci]);
+      s_input[idx] = static_cast<scalar_t>(val);
+    }
+  }
+  __syncthreads();
+
+  float weight_reg[WEIGHT_SIZE];
+  for (int w = 0; w < WEIGHT_SIZE; ++w) {
+    weight_reg[w] = static_cast<float>(s_weight[w]);
+  }
+
+  const int num_outputs = oH * oW;
+  #pragma unroll 2
+  for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
+    const int oh = out_linear / oW;
+    const int ow = out_linear % oW;
+    float sum = 0.0f;
+
+    float input_reg[WEIGHT_SIZE];
+    {
+      int wi_load = 0;
+      for (int kf = 0; kf < kT; ++kf) {
+        for (int kr = 0; kr < kH; ++kr) {
+          for (int kc = 0; kc < kW; ++kc, ++wi_load) {
+            const int hr = oh * strideH + kr * dilationH_;
+            const int wc = ow * strideW + kc * dilationW_;
+            const int in_idx = kf * in_tile_hw + hr * in_tile_w + wc;
+            input_reg[wi_load] = static_cast<float>(s_input[in_idx]);
+          }
+        }
+      }
+    }
+
+    int wi = 0;
+    for (int kf = 0; kf < kT; ++kf) {
+      for (int kr = 0; kr < kH; ++kr) {
+        for (int kc = 0; kc < kW; ++kc, ++wi) {
+          sum += weight_reg[wi] * input_reg[wi];
+        }
+      }
+    }
+    if (bias != nullptr) sum += static_cast<float>(bias[out_channel]);
+    output[b][out_channel][out_frame][oh][ow] = static_cast<scalar_t>(sum);
+  }
+}
+
 template <typename scalar_t, typename accscalar_t,
     int kKnownKernelT, int kKnownKernelH, int kKnownKernelW,
     int kKnownDilationT, int kKnownDilationH, int kKnownDilationW,
@@ -371,6 +476,50 @@ void conv_depthwise_shape_check(
     C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
   } else
 
+// Dispatch conv_depthwise3d_cuda_kernel_smem kernel with dynamic shared memory; 
+// Requires stride (st, sh, sw) to match kernel size (kt, kh, kw) and dilation (dilt, dilh, dilw).
+#define DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION_SMEM(kt, kh, kw, dilt, dilh, dilw, st, sh, sw) \
+  if (NODEF_OR_EQUAL_3(kernel_size, (kt), (kh), (kw)) &&                    \
+      NODEF_OR_EQUAL_3(dilation, (dilt), (dilh), (dilw)) &&                 \
+      NODEF_OR_EQUAL_3(stride, (st), (sh), (sw))) {                         \
+    const int64_t batch = output_.size(0);                                  \
+    const int64_t oC = output_.size(1);                                     \
+    const int64_t oT = output_.size(2);                                     \
+    const int oH = static_cast<int>(output_.size(3));                       \
+    const int oW = static_cast<int>(output_.size(4));                       \
+    constexpr int kT = (kt), kH = (kh), kW = (kw);                          \
+    constexpr int weight_size = kT * kH * kW;                               \
+    const int in_tile_h =                                                   \
+        (oH - 1) * stride[1] + (kH - 1) * dilation[1] + 1;                  \
+    const int in_tile_w =                                                   \
+        (oW - 1) * stride[2] + (kW - 1) * dilation[2] + 1;                  \
+    const int64_t input_patch_size =                                        \
+        static_cast<int64_t>(kT) * in_tile_h * in_tile_w;                   \
+    const int64_t smem_bytes =                                              \
+        (static_cast<int64_t>(weight_size) + input_patch_size) *            \
+        static_cast<int64_t>(sizeof(scalar_t));                             \
+    cudaDeviceProp* dev_prop =                                              \
+        at::cuda::getDeviceProperties(output_.device().index());            \
+    TORCH_CHECK(                                                            \
+        smem_bytes <= static_cast<int64_t>(dev_prop->sharedMemPerBlock),    \
+        "Required dynamic shared memory (", smem_bytes,                     \
+        " bytes) exceeds sharedMemPerBlock (",                              \
+        dev_prop->sharedMemPerBlock, ") for this device; Please use a "     \
+        "smaller spatial size or a different conv configuration");          \
+    constexpr int64_t block_size = 256;                                     \
+    conv_depthwise3d_cuda_kernel_smem<scalar_t, (kt), (kh), (kw)>           \
+        <<<batch * oC * oT, block_size, smem_bytes,                         \
+           at::cuda::getCurrentCUDAStream()>>>(                             \
+            input_.packed_accessor32<const scalar_t, 5>(),                  \
+            output_.packed_accessor32<scalar_t, 5>(),                       \
+            weight_.packed_accessor32<const scalar_t, 5>(),                 \
+            bias_ptr,                                                       \
+            stride[0], stride[1], stride[2],                                \
+            padding[0], padding[1], padding[2],                             \
+            dilation[0], dilation[1], dilation[2]);                         \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
+  } else
+
 #define DWCONV3D_FORWARD_DISPATCH_OTHERS \
   {                                      \
     using accscalar_t = acc_type<scalar_t, true>;                           \
@@ -431,7 +580,7 @@ Tensor conv_depthwise3d_cuda(
       [&]{
         int64_t num_outputs = output_.numel();
         int64_t block = 256;
-        int64_t grid = std::min((num_outputs - 1) / block + 1, (int64_t)65536);
+        int64_t grid = std::min((num_outputs - 1) / block + 1, (int64_t)65536 * 6);
         int64_t smem = 0;
 
         const scalar_t* bias_ptr =
@@ -449,6 +598,7 @@ Tensor conv_depthwise3d_cuda(
                       "Padded input tensor is too large.");
         }
 
+        DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION_SMEM(3, 5, 5, 1, 1, 1, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(3, 5, 5, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(3, 3, 3, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(-1, -1, -1, 1, 1, 1)
@@ -459,6 +609,7 @@ Tensor conv_depthwise3d_cuda(
   return output;
 }
 
+#undef DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION_SMEM
 #undef DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION
 #undef DWCONV3D_FORWARD_DISPATCH_OTHERS
 

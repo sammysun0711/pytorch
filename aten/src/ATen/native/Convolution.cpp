@@ -1212,17 +1212,18 @@ static ConvBackend _select_conv_backend(
   if (params.is_depthwise(input, weight)) {
     if (params.use_cudnn_depthwise(input, weight)) {
       return ConvBackend::Cudnn;
-    // } else if (params.use_miopen(input, weight, bias_sizes_opt.has_value())) {
-    //   return ConvBackend::MiopenDepthwise;
-    } else {
-      if (input.ndimension() == 4) {
-        return ConvBackend::CudaDepthwise2d;
-      } else if (input.ndimension() == 5) {
-        return ConvBackend::CudaDepthwise3d;
-      } else {
-        // unsupported
-      }
     }
+    // Depthwise conv3d: prefer native CUDA/HIP (DepthwiseConv3d) over MIOpen when applicable.
+    if (input.ndimension() == 5) {
+      return ConvBackend::CudaDepthwise3d;
+    }
+    if (params.use_miopen(input, weight, bias_sizes_opt.has_value())) {
+      return ConvBackend::MiopenDepthwise;
+    }
+    if (input.ndimension() == 4) {
+      return ConvBackend::CudaDepthwise2d;
+    }
+    // unsupported
   } else if (params.use_cudnn(input, weight)) {
     if (params.transposed) {
       return ConvBackend::CudnnTranspose;
