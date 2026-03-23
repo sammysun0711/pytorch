@@ -18,9 +18,39 @@
 #include <algorithm>
 #include <tuple>
 #include <limits>
+#include <type_traits>
+
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#endif
 
 namespace at::native {
 namespace {
+
+#if defined(USE_ROCM)
+// ROCm vec_dot builtin functions usage
+// bf16 uses __builtin_amdgcn_fdot2_f32_bf16 on __gfx950__;
+// fp16 uses __builtin_amdgcn_fdot2 on __gfx950__ || __gfx942__.
+// Guard with __HIP_DEVICE_COMPILE__, arch macros, and __has_builtin; else fallback to scalar MAC.
+using dwconv_bf16x2 = short __attribute__((vector_size(4)));
+using dwconv_f16x2 = __fp16 __attribute__((vector_size(4)));
+
+__device__ __forceinline__ dwconv_bf16x2 dwconv_pack_bf16_dot2(float a, float b) {
+  dwconv_bf16x2 v;
+  reinterpret_cast<c10::BFloat16*>(&v)[0] = c10::BFloat16(a);
+  reinterpret_cast<c10::BFloat16*>(&v)[1] = c10::BFloat16(b);
+  return v;
+}
+
+__device__ __forceinline__ dwconv_f16x2 dwconv_pack_f16_dot2(float a, float b) {
+  dwconv_f16x2 v;
+  reinterpret_cast<c10::Half*>(&v)[0] = c10::Half(a);
+  reinterpret_cast<c10::Half*>(&v)[1] = c10::Half(b);
+  return v;
+}
+#endif // USE_ROCM
 
 template <typename scalar_t, typename accscalar_t,
     int kKnownKernelT, int kKnownKernelH, int kKnownKernelW,
@@ -185,11 +215,43 @@ __global__ void conv_depthwise3d_cuda_kernel_smem(
       }
     }
 
-    int wi = 0;
-    for (int kf = 0; kf < kT; ++kf) {
-      for (int kr = 0; kr < kH; ++kr) {
-        for (int kc = 0; kc < kW; ++kc, ++wi) {
-          sum += weight_reg[wi] * input_reg[wi];
+#if defined(USE_ROCM) && defined(__clang__) && defined(__HIP_DEVICE_COMPILE__) && \
+    defined(__gfx950__) && defined(__has_builtin) &&                               \
+    __has_builtin(__builtin_amdgcn_fdot2_f32_bf16)
+    if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+      for (int w = 0; w + 1 < WEIGHT_SIZE; w += 2) {
+        const dwconv_bf16x2 wa = dwconv_pack_bf16_dot2(weight_reg[w + 0], weight_reg[w + 1]);
+        const dwconv_bf16x2 xi = dwconv_pack_bf16_dot2(input_reg[w + 0], input_reg[w + 1]);
+        sum = __builtin_amdgcn_fdot2_f32_bf16(wa, xi, sum, false);
+      }
+      if constexpr (WEIGHT_SIZE & 1) {
+        sum += weight_reg[WEIGHT_SIZE - 1] * input_reg[WEIGHT_SIZE - 1];
+      }
+    } else
+#endif
+#if defined(USE_ROCM) && defined(__clang__) && defined(__HIP_DEVICE_COMPILE__) && \
+    (defined(__gfx950__) || defined(__gfx942__)) && defined(__has_builtin) &&      \
+    __has_builtin(__builtin_amdgcn_fdot2)
+    if constexpr (std::is_same_v<scalar_t, c10::Half>) {
+      for (int w = 0; w + 1 < WEIGHT_SIZE; w += 2) {
+        const dwconv_f16x2 wa =
+            dwconv_pack_f16_dot2(weight_reg[w + 0], weight_reg[w + 1]);
+        const dwconv_f16x2 xi =
+            dwconv_pack_f16_dot2(input_reg[w + 0], input_reg[w + 1]);
+        sum = __builtin_amdgcn_fdot2(wa, xi, sum, false);
+      }
+      if constexpr (WEIGHT_SIZE & 1) {
+        sum += weight_reg[WEIGHT_SIZE - 1] * input_reg[WEIGHT_SIZE - 1];
+      }
+    } else
+#endif
+    {
+      int wi = 0;
+      for (int kf = 0; kf < kT; ++kf) {
+        for (int kr = 0; kr < kH; ++kr) {
+          for (int kc = 0; kc < kW; ++kc, ++wi) {
+            sum += weight_reg[wi] * input_reg[wi];
+          }
         }
       }
     }
@@ -580,7 +642,7 @@ Tensor conv_depthwise3d_cuda(
       [&]{
         int64_t num_outputs = output_.numel();
         int64_t block = 256;
-        int64_t grid = std::min((num_outputs - 1) / block + 1, (int64_t)65536 * 6);
+        int64_t grid = std::min((num_outputs - 1) / block + 1, (int64_t)65536);
         int64_t smem = 0;
 
         const scalar_t* bias_ptr =
@@ -598,8 +660,10 @@ Tensor conv_depthwise3d_cuda(
                       "Padded input tensor is too large.");
         }
 
+#if defined(USE_ROCM)
+        // Dynamic shared memory & vec_dot path is ROCm-only (amdgcn dot2, etc.)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION_SMEM(3, 5, 5, 1, 1, 1, 1, 1, 1)
-        DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(3, 5, 5, 1, 1, 1)
+#endif
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(3, 3, 3, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_SPECIALIZATION(-1, -1, -1, 1, 1, 1)
         DWCONV3D_FORWARD_DISPATCH_OTHERS
